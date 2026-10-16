@@ -1,11 +1,38 @@
 """Stable person rename and bounded exact-alias retention."""
 
+import logging
 from datetime import datetime, timezone
 from database import chat_edits
-from typing import Any
+from typing import Any, Optional
 
 from google.api_core.exceptions import NotFound
 from google.cloud.firestore_v1 import FieldFilter, transactional
+
+logger = logging.getLogger(__name__)
+
+_MAX_ID_LENGTH = 256
+# Firestore document IDs are path segments: separators and the reserved colon
+# must never reach the collection/document path builder.
+_UNSAFE_ID_CHARS = ('/', '\\', ':')
+
+
+def _clean_id(value: Any) -> Optional[str]:
+    """Return a safe Firestore path segment, or None when the value is unsafe.
+
+    Person identifiers are used verbatim as `users/{uid}/people/{person_id}`
+    path segments, so non-string, empty, oversized, and separator-bearing
+    values are rejected before any query or transaction is opened.
+    """
+    if not isinstance(value, str):
+        return None
+    cleaned = value.strip()
+    if not cleaned or len(cleaned) > _MAX_ID_LENGTH:
+        return None
+    if cleaned in ('.', '..'):
+        return None
+    if any(char in cleaned for char in _UNSAFE_ID_CHARS):
+        return None
+    return cleaned
 
 
 def normalized_person_alias(value: Any) -> str | None:
@@ -61,12 +88,24 @@ def rename_person_retaining_aliases(
 ) -> bool:
     """Rename an owner-scoped person and map concurrent deletion to missing."""
 
-    person_ref = db_client.collection('users').document(uid).collection('people').document(person_id)
+    clean_uid = _clean_id(uid)
+    clean_person_id = _clean_id(person_id)
+    if clean_uid is None or clean_person_id is None:
+        logger.warning('Refusing person rename for invalid identifiers')
+        return False
+
+    person_ref = db_client.collection('users').document(clean_uid).collection('people').document(clean_person_id)
     try:
         if expected_chat_state is not None:
             return update_person_name_transaction(db_client.transaction(), person_ref, name, expected_chat_state)
         return update_person_name_transaction(db_client.transaction(), person_ref, name)
     except NotFound:
+        return False
+    except PermissionError:
+        # Optimistic-concurrency conflicts are meaningful to callers; let them through.
+        raise
+    except Exception:
+        logger.exception('Person rename failed for uid=%s person_id=%s', clean_uid, clean_person_id)
         return False
 
 
@@ -96,17 +135,56 @@ def dismiss_person_transaction(transaction: Any, person_ref: Any) -> bool:
 def dismiss_person_soft(db_client: Any, uid: str, person_id: str) -> bool:
     """Soft-dismiss an owner-scoped person and map concurrent deletion to missing."""
 
-    person_ref = db_client.collection('users').document(uid).collection('people').document(person_id)
+    clean_uid = _clean_id(uid)
+    clean_person_id = _clean_id(person_id)
+    if clean_uid is None or clean_person_id is None:
+        logger.warning('Refusing person dismissal for invalid identifiers')
+        return False
+
+    person_ref = db_client.collection('users').document(clean_uid).collection('people').document(clean_person_id)
     try:
         return dismiss_person_transaction(db_client.transaction(), person_ref)
     except NotFound:
         return False
+    except Exception:
+        logger.exception('Person dismissal failed for uid=%s person_id=%s', clean_uid, clean_person_id)
+        return False
+
+
+def get_person_aliases(db_client: Any, uid: str, person_id: str) -> list[str]:
+    """Return the retained exact aliases for one person, or [] when unavailable."""
+
+    clean_uid = _clean_id(uid)
+    clean_person_id = _clean_id(person_id)
+    if clean_uid is None or clean_person_id is None:
+        logger.warning('Refusing person alias lookup for invalid identifiers')
+        return []
+
+    person_ref = db_client.collection('users').document(clean_uid).collection('people').document(clean_person_id)
+    try:
+        snapshot = person_ref.get()
+    except Exception:
+        logger.exception('Person alias lookup failed for uid=%s person_id=%s', clean_uid, clean_person_id)
+        return []
+    if not getattr(snapshot, 'exists', False):
+        return []
+    raw = snapshot.to_dict()
+    data = raw if isinstance(raw, dict) else {}
+    stored = data.get('aliases')
+    if not isinstance(stored, list):
+        return []
+    return [alias for alias in (normalized_person_alias(value) for value in stored) if alias is not None]
 
 
 def list_people(db_client: Any, uid: str, *, include_dismissed: bool = False) -> list[dict[str, Any]]:
     """List owner-scoped people, hiding soft-dismissed records by default."""
 
-    people_ref = db_client.collection('users').document(uid).collection('people')
+    clean_uid = _clean_id(uid)
+    if clean_uid is None:
+        logger.warning('Refusing person listing for invalid identifier')
+        return []
+
+    people_ref = db_client.collection('users').document(clean_uid).collection('people')
     result = []
     for person in people_ref.stream():
         data = person.to_dict()
@@ -120,7 +198,12 @@ def list_people(db_client: Any, uid: str, *, include_dismissed: bool = False) ->
 def find_person_by_name(db_client: Any, uid: str, name: str) -> dict[str, Any] | None:
     """Find the first active owner-scoped person with an exact display name."""
 
-    people_ref = db_client.collection('users').document(uid).collection('people')
+    clean_uid = _clean_id(uid)
+    if clean_uid is None:
+        logger.warning('Refusing person lookup for invalid identifier')
+        return None
+
+    people_ref = db_client.collection('users').document(clean_uid).collection('people')
     query = people_ref.where(filter=FieldFilter('name', '==', name))
     for person in query.stream():
         data = person.to_dict()
